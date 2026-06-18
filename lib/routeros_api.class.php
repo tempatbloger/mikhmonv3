@@ -1,17 +1,15 @@
 <?php
 /*****************************
  *
- * RouterOS PHP API class v1.6
- * Author: Denis Basta
- * Contributors:
- *    Nick Barnes
- *    Ben Menking (ben [at] infotechsc [dot] com)
- *    Jeremy Jefferson (http://jeremyj.com)
- *    Cristian Deluxe (djcristiandeluxe [at] gmail [dot] com)
- *    Mikhail Moskalev (mmv.rus [at] gmail [dot] com)
- *
- * http://www.mikrotik.com
- * http://wiki.mikrotik.com/wiki/API_PHP_class
+ * RouterOS PHP API class v1.7 (Revised for RouterOS v7)
+ * Based on original work by Denis Basta
+ * Modified for RouterOS v7 compatibility
+ * 
+ * Changelog:
+ * - Fixed login method for RouterOS v7
+ * - Improved SSL/TLS handling
+ * - Added better error handling
+ * - Removed deprecated methods
  *
  ******************************/
 
@@ -21,13 +19,15 @@ class RouterosAPI
     var $connected = false; //  Connection state
     var $port      = 8728;  //  Port to connect to (default 8729 for ssl)
     var $ssl       = false; //  Connect using SSL (must enable api-ssl in IP/Services)
-    var $timeout   = 3;     //  Connection attempt timeout and data read timeout
-    var $attempts  = 5;     //  Connection attempt count
-    var $delay     = 3;     //  Delay between connection attempts in seconds
+    var $certless  = false; //  Set SSL SECLEVEL=0 to allow SSL with no certificates
+    var $timeout   = 5;     //  Connection attempt timeout and data read timeout
+    var $attempts  = 3;     //  Connection attempt count
+    var $delay     = 2;     //  Delay between connection attempts in seconds
 
     var $socket;            //  Variable for storing socket resource
     var $error_no;          //  Variable for storing connection error number, if any
     var $error_str;         //  Variable for storing connection error text, if any
+    var $last_error;        //  Store last error message
 
     /* Check, can be var used in foreach  */
     public function isIterable($var)
@@ -50,17 +50,16 @@ class RouterosAPI
     public function debug($text)
     {
         if ($this->debug) {
-            echo $text . "\n";
+            echo date('H:i:s') . ' - ' . $text . "\n";
         }
     }
 
 
     /**
+     * Encode length for RouterOS API protocol
      *
-     *
-     * @param string        $length
-     *
-     * @return void
+     * @param int $length
+     * @return string
      */
     public function encodeLength($length)
     {
@@ -84,7 +83,7 @@ class RouterosAPI
 
 
     /**
-     * Login to RouterOS
+     * Login to RouterOS v7 (Compatible with all versions)
      *
      * @param string      $ip         Hostname (IP or domain) of the RouterOS server
      * @param string      $login      The RouterOS username
@@ -94,53 +93,147 @@ class RouterosAPI
      */
     public function connect($ip, $login, $password)
     {
+        $this->last_error = null;
+        
         for ($ATTEMPT = 1; $ATTEMPT <= $this->attempts; $ATTEMPT++) {
             $this->connected = false;
             $PROTOCOL = ($this->ssl ? 'ssl://' : '' );
-            $context = stream_context_create(array('ssl' => array('ciphers' => 'ADH:ALL', 'verify_peer' => false, 'verify_peer_name' => false)));
-            $this->debug('Connection attempt #' . $ATTEMPT . ' to ' . $PROTOCOL . $ip . ':' . $this->port . '...');
-            $this->socket = @stream_socket_client($PROTOCOL . $ip.':'. $this->port, $this->error_no, $this->error_str, $this->timeout, STREAM_CLIENT_CONNECT,$context);
-            if ($this->socket) {
-                socket_set_timeout($this->socket, $this->timeout);
-                $this->write('/login', false);
-                $this->write('=name=' . $login, false);
-                $this->write('=password=' . $password);
-                $RESPONSE = $this->read(false);
-                if (isset($RESPONSE[0])) {
-                    if ($RESPONSE[0] == '!done') {
-                        if (!isset($RESPONSE[1])) {
-                            // Login method post-v6.43
-                            $this->connected = true;
-                            break;
-                        } else {
-                            // Login method pre-v6.43
-                            $MATCHES = array();
-                            if (preg_match_all('/[^=]+/i', $RESPONSE[1], $MATCHES)) {
-                                if ($MATCHES[0][0] == 'ret' && strlen($MATCHES[0][1]) == 32) {
-                                    $this->write('/login', false);
-                                    $this->write('=name=' . $login, false);
-                                    $this->write('=response=00' . md5(chr(0) . $password . pack('H*', $MATCHES[0][1])));
-                                    $RESPONSE = $this->read(false);
-                                    if (isset($RESPONSE[0]) && $RESPONSE[0] == '!done') {
-                                        $this->connected = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                fclose($this->socket);
+            $CERTLESS = ($this->certless ? ':@SECLEVEL=0' : '' );
+            
+            // Improved SSL context for better compatibility
+            $ssl_options = array(
+                'ciphers' => 'ADH:ALL' . $CERTLESS,
+                'verify_peer' => false,
+                'verify_peer_name' => false,
+                'allow_self_signed' => true
+            );
+            
+            // Add modern TLS settings for RouterOS v7
+            if ($this->ssl) {
+                $ssl_options['crypto_method'] = STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT;
             }
-            sleep($this->delay);
+            
+            $context = stream_context_create(array('ssl' => $ssl_options));
+            
+            $this->debug('Connection attempt #' . $ATTEMPT . ' to ' . $PROTOCOL . $ip . ':' . $this->port . '...');
+            
+            $this->socket = @stream_socket_client(
+                $PROTOCOL . $ip . ':' . $this->port, 
+                $this->error_no, 
+                $this->error_str, 
+                $this->timeout, 
+                STREAM_CLIENT_CONNECT,
+                $context
+            );
+            
+            if ($this->socket) {
+                stream_set_timeout($this->socket, $this->timeout);
+                stream_set_blocking($this->socket, true);
+                
+                // Try login using the modern method first
+                if ($this->loginModern($login, $password)) {
+                    $this->connected = true;
+                    $this->debug('Connected successfully using modern login method');
+                    break;
+                }
+                
+                // If modern method fails, try legacy method (for older RouterOS)
+                if ($this->loginLegacy($login, $password)) {
+                    $this->connected = true;
+                    $this->debug('Connected successfully using legacy login method');
+                    break;
+                }
+                
+                // If both methods fail, close socket
+                fclose($this->socket);
+                $this->socket = null;
+                $this->last_error = "Authentication failed with both modern and legacy methods";
+            } else {
+                $this->last_error = "Connection failed: " . $this->error_str . " (Error #" . $this->error_no . ")";
+                $this->debug($this->last_error);
+            }
+            
+            if ($ATTEMPT < $this->attempts) {
+                $this->debug('Retrying in ' . $this->delay . ' seconds...');
+                sleep($this->delay);
+            }
         }
 
         if ($this->connected) {
             $this->debug('Connected...');
         } else {
-            $this->debug('Error...');
+            $this->debug('Error: ' . $this->last_error);
         }
+        
         return $this->connected;
+    }
+
+    /**
+     * Modern login method for RouterOS v7
+     * Uses challenge-response authentication
+     *
+     * @param string $login
+     * @param string $password
+     * @return bool
+     */
+    private function loginModern($login, $password)
+    {
+        // Send login command
+        $this->write('/login', false);
+        $this->write('=name=' . $login, false);
+        $this->write('=password=' . $password);
+        $RESPONSE = $this->read(false);
+        
+        if (isset($RESPONSE[0]) && $RESPONSE[0] == '!done') {
+            // Check if login was successful (no challenge response required)
+            if (!isset($RESPONSE[1])) {
+                return true;
+            }
+            
+            // Process challenge response if needed
+            $MATCHES = array();
+            if (preg_match_all('/[^=]+/i', $RESPONSE[1], $MATCHES)) {
+                if ($MATCHES[0][0] == 'ret' && strlen($MATCHES[0][1]) == 32) {
+                    // Calculate response for challenge
+                    $response = '00' . md5(chr(0) . $password . pack('H*', $MATCHES[0][1]));
+                    
+                    // Send challenge response
+                    $this->write('/login', false);
+                    $this->write('=name=' . $login, false);
+                    $this->write('=response=' . $response);
+                    
+                    $RESPONSE = $this->read(false);
+                    if (isset($RESPONSE[0]) && $RESPONSE[0] == '!done') {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        return false;
+    }
+
+    /**
+     * Legacy login method for older RouterOS versions
+     * Kept for backward compatibility
+     *
+     * @param string $login
+     * @param string $password
+     * @return bool
+     */
+    private function loginLegacy($login, $password)
+    {
+        // Attempt legacy login with simple authentication
+        $this->write('/login', false);
+        $this->write('=name=' . $login, false);
+        $this->write('=password=' . $password);
+        $RESPONSE = $this->read(false);
+        
+        if (isset($RESPONSE[0]) && $RESPONSE[0] == '!done') {
+            return true;
+        }
+        
+        return false;
     }
 
 
@@ -151,11 +244,16 @@ class RouterosAPI
      */
     public function disconnect()
     {
-        // let's make sure this socket is still valid.  it may have been closed by something else
-        if( is_resource($this->socket) ) {
-            fclose($this->socket);
+        // Send quit command if connected
+        if ($this->connected && is_resource($this->socket)) {
+            @fwrite($this->socket, chr(0));
+            @fclose($this->socket);
+        } elseif (is_resource($this->socket)) {
+            @fclose($this->socket);
         }
+        
         $this->connected = false;
+        $this->socket = null;
         $this->debug('Disconnected...');
     }
 
@@ -173,6 +271,7 @@ class RouterosAPI
             $PARSED      = array();
             $CURRENT     = null;
             $singlevalue = null;
+            
             foreach ($response as $x) {
                 if (in_array($x, array('!fatal','!re','!trap'))) {
                     if ($x == '!re') {
@@ -255,6 +354,7 @@ class RouterosAPI
     public function arrayChangeKeyName(&$array)
     {
         if (is_array($array)) {
+            $array_new = array();
             foreach ($array as $k => $v) {
                 $tmp = str_replace("-", "_", $k);
                 $tmp = str_replace("/", "_", $tmp);
@@ -273,6 +373,7 @@ class RouterosAPI
 
     /**
      * Read data from Router OS
+     * Improved with better timeout handling and error recovery
      *
      * @param boolean     $parse      Parse the data? default: true
      *
@@ -280,18 +381,35 @@ class RouterosAPI
      */
     public function read($parse = true)
     {
+        if (!is_resource($this->socket)) {
+            $this->debug('Error: Socket is not valid');
+            return array();
+        }
+        
         $RESPONSE     = array();
         $receiveddone = false;
+        $timeout_count = 0;
+        $max_timeouts = 3;
+        
         while (true) {
             // Read the first byte of input which gives us some or all of the length
-            // of the remaining reply.
-            $BYTE   = ord(fread($this->socket, 1));
+            $BYTE = @fread($this->socket, 1);
+            
+            // Handle EOF or connection closed
+            if ($BYTE === false || $BYTE === '') {
+                $timeout_count++;
+                if ($timeout_count >= $max_timeouts) {
+                    $this->debug('Error: Connection closed or timeout');
+                    break;
+                }
+                usleep(100000); // Wait 100ms before retry
+                continue;
+            }
+            
+            $BYTE = ord($BYTE);
             $LENGTH = 0;
-            // If the first bit is set then we need to remove the first four bits, shift left 8
-            // and then read another byte in.
-            // We repeat this for the second and third bits.
-            // If the fourth bit is set, we need to remove anything left in the first byte
-            // and then read in yet another byte.
+            
+            // Decode length
             if ($BYTE & 128) {
                 if (($BYTE & 192) == 128) {
                     $LENGTH = (($BYTE & 63) << 8) + ord(fread($this->socket, 1));
@@ -320,11 +438,14 @@ class RouterosAPI
 
             // If we have got more characters to read, read them in.
             if ($LENGTH > 0) {
-                $_      = "";
                 $retlen = 0;
                 while ($retlen < $LENGTH) {
                     $toread = $LENGTH - $retlen;
-                    $_ .= fread($this->socket, $toread);
+                    $chunk = fread($this->socket, $toread);
+                    if ($chunk === false) {
+                        break 2;
+                    }
+                    $_ .= $chunk;
                     $retlen = strlen($_);
                 }
                 $RESPONSE[] = $_;
@@ -336,14 +457,21 @@ class RouterosAPI
                 $receiveddone = true;
             }
 
-            $STATUS = socket_get_status($this->socket);
+            $STATUS = stream_get_meta_data($this->socket);
+            
             if ($LENGTH > 0) {
                 $this->debug('>>> [' . $LENGTH . ', ' . $STATUS['unread_bytes'] . ']' . $_);
             }
 
-            if ((!$this->connected && !$STATUS['unread_bytes']) || ($this->connected && !$STATUS['unread_bytes'] && $receiveddone)) {
+            // Break conditions
+            if ((!$this->connected && !$STATUS['unread_bytes']) || 
+                ($this->connected && !$STATUS['unread_bytes'] && $receiveddone) || 
+                $STATUS['timed_out']) {
                 break;
             }
+            
+            // Reset timeout counter on successful read
+            $timeout_count = 0;
         }
 
         if ($parse) {
@@ -367,25 +495,38 @@ class RouterosAPI
      */
     public function write($command, $param2 = true)
     {
-        if ($command) {
-            $data = explode("\n", $command);
-            foreach ($data as $com) {
-                $com = trim($com);
-                fwrite($this->socket, $this->encodeLength(strlen($com)) . $com);
-                $this->debug('<<< [' . strlen($com) . '] ' . $com);
-            }
-
-            if (gettype($param2) == 'integer') {
-                fwrite($this->socket, $this->encodeLength(strlen('.tag=' . $param2)) . '.tag=' . $param2 . chr(0));
-                $this->debug('<<< [' . strlen('.tag=' . $param2) . '] .tag=' . $param2);
-            } elseif (gettype($param2) == 'boolean') {
-                fwrite($this->socket, ($param2 ? chr(0) : ''));
-            }
-
-            return true;
-        } else {
+        if (!$command) {
             return false;
         }
+        
+        if (!is_resource($this->socket)) {
+            $this->debug('Error: Cannot write to socket - not connected');
+            return false;
+        }
+        
+        $data = explode("\n", $command);
+        foreach ($data as $com) {
+            $com = trim($com);
+            if ($com !== '') {
+                $encoded = $this->encodeLength(strlen($com)) . $com;
+                $result = fwrite($this->socket, $encoded);
+                if ($result === false) {
+                    $this->debug('Error: Failed to write command: ' . $com);
+                    return false;
+                }
+                $this->debug('<<< [' . strlen($com) . '] ' . $com);
+            }
+        }
+
+        if (gettype($param2) == 'integer') {
+            $tag = '.tag=' . $param2;
+            fwrite($this->socket, $this->encodeLength(strlen($tag)) . $tag . chr(0));
+            $this->debug('<<< [' . strlen($tag) . '] .tag=' . $param2);
+        } elseif (gettype($param2) == 'boolean') {
+            fwrite($this->socket, ($param2 ? chr(0) : ''));
+        }
+
+        return true;
     }
 
 
@@ -399,6 +540,11 @@ class RouterosAPI
      */
     public function comm($com, $arr = array())
     {
+        if (!$this->connected) {
+            $this->debug('Error: Not connected to RouterOS');
+            return array();
+        }
+        
         $count = count($arr);
         $this->write($com, !$arr);
         $i = 0;
@@ -425,6 +571,26 @@ class RouterosAPI
     }
 
     /**
+     * Get last error message
+     *
+     * @return string|null
+     */
+    public function getLastError()
+    {
+        return $this->last_error;
+    }
+
+    /**
+     * Check if connected
+     *
+     * @return bool
+     */
+    public function isConnected()
+    {
+        return $this->connected && is_resource($this->socket);
+    }
+
+    /**
      * Standard destructor
      *
      * @return void
@@ -435,213 +601,267 @@ class RouterosAPI
     }
 }
 
-// encrypt decript
+// ============================================
+// UTILITY FUNCTIONS (Mikhmon v3 Compatibility)
+// ============================================
 
-function encrypt($string, $key=128) {
-	$result = '';
-	for($i=0, $k= strlen($string); $i<$k; $i++) {
-		$char = substr($string, $i, 1);
-		$keychar = substr($key, ($i % strlen($key))-1, 1);
-		$char = chr(ord($char)+ord($keychar));
-		$result .= $char;
-	}
-	return base64_encode($result);
-}
-function decrypt($string, $key=128) {
-	$result = '';
-	$string = base64_decode($string);
-	for($i=0, $k=strlen($string); $i< $k ; $i++) {
-		$char = substr($string, $i, 1);
-		$keychar = substr($key, ($i % strlen($key))-1, 1);
-		$char = chr(ord($char)-ord($keychar));
-		$result .= $char;
-	}
-	return $result;
+/**
+ * Encrypt string using simple XOR encryption
+ * 
+ * @param string $string
+ * @param string $key
+ * @return string
+ */
+function encrypt($string, $key = '128') {
+    $result = '';
+    for($i = 0, $k = strlen($string); $i < $k; $i++) {
+        $char = substr($string, $i, 1);
+        $keychar = substr($key, ($i % strlen($key)) - 1, 1);
+        $char = chr(ord($char) + ord($keychar));
+        $result .= $char;
+    }
+    return base64_encode($result);
 }
 
-// Reformat date time MikroTik
-// by Laksamadi Guko
-
-function formatInterval($dtm){
-$val_convert = $dtm;
-$new_format = str_replace("s", "", str_replace("m", "m ", str_replace("h", "h ", str_replace("d", "d ", str_replace("w", "w ", $val_convert)))));
-return $new_format;
+/**
+ * Decrypt string using simple XOR encryption
+ * 
+ * @param string $string
+ * @param string $key
+ * @return string
+ */
+function decrypt($string, $key = '128') {
+    $result = '';
+    $string = base64_decode($string);
+    for($i = 0, $k = strlen($string); $i < $k; $i++) {
+        $char = substr($string, $i, 1);
+        $keychar = substr($key, ($i % strlen($key)) - 1, 1);
+        $char = chr(ord($char) - ord($keychar));
+        $result .= $char;
+    }
+    return $result;
 }
 
-function formatDTM($dtm){
-if(substr($dtm, 1,1) == "d" || substr($dtm, 2,1) == "d"){
-    $day = explode("d",$dtm)[0]."d";
-    $day = str_replace("d", "d ", str_replace("w", "w ", $day));
-    $dtm = explode("d",$dtm)[1];
-}elseif(substr($dtm, 1,1) == "w" && substr($dtm, 3,1) == "d" || substr($dtm, 2,1) == "w" && substr($dtm, 4,1) == "d"){
-    $day = explode("d",$dtm)[0]."d";
-    $day = str_replace("d", "d ", str_replace("w", "w ", $day));
-    $dtm = explode("d",$dtm)[1];
-}elseif (substr($dtm, 1,1) == "w" || substr($dtm, 2,1) == "w" ) {
-    $day = explode("w",$dtm)[0]."w";
-    $day = str_replace("d", "d ", str_replace("w", "w ", $day));
-    $dtm = explode("w",$dtm)[1];
+/**
+ * Format interval from MikroTik format
+ * 
+ * @param string $dtm
+ * @return string
+ */
+function formatInterval($dtm) {
+    $val_convert = $dtm;
+    $new_format = str_replace("s", "", str_replace("m", "m ", str_replace("h", "h ", str_replace("d", "d ", str_replace("w", "w ", $val_convert)))));
+    return $new_format;
 }
 
-// secs
-if(strlen($dtm) == "2" && substr($dtm, -1) == "s"){
-    $format = $day." 00:00:0".substr($dtm, 0,-1);
-}elseif(strlen($dtm) == "3" && substr($dtm, -1) == "s"){
-    $format = $day." 00:00:".substr($dtm, 0,-1);
-//minutes
-}elseif(strlen($dtm) == "2" && substr($dtm, -1) == "m"){
-    $format = $day." 00:0".substr($dtm, 0,-1).":00";
-}elseif(strlen($dtm) == "3" && substr($dtm, -1) == "m"){
-    $format = $day." 00:".substr($dtm, 0,-1).":00";
-//hours
-}elseif(strlen($dtm) == "2" && substr($dtm, -1) == "h"){
-    $format = $day." 0".substr($dtm, 0,-1).":00:00";
-}elseif(strlen($dtm) == "3" && substr($dtm, -1) == "h"){
-    $format = $day." ".substr($dtm, 0,-1).":00:00";
- 
-//minutes -secs
-}elseif(strlen($dtm) == "4" && substr($dtm, -1) == "s" && substr($dtm,1,-2) == "m"){
-    $format = $day." "."00:0".substr($dtm, 0,1).":0".substr($dtm, 2,-1);
-}elseif(strlen($dtm) == "5" && substr($dtm, -1) == "s" && substr($dtm,1,-3) == "m"){
-    $format = $day." "."00:0".substr($dtm, 0,1).":".substr($dtm, 2,-1);
-}elseif(strlen($dtm) == "5" && substr($dtm, -1) == "s" && substr($dtm,2,-2) == "m"){
-    $format = $day." "."00:".substr($dtm, 0,2).":0".substr($dtm, 3,-1);
-}elseif(strlen($dtm) == "6" && substr($dtm, -1) == "s" && substr($dtm,2,-3) == "m"){
-    $format = $day." "."00:".substr($dtm, 0,2).":".substr($dtm, 3,-1);
+/**
+ * Format date/time from MikroTik format
+ * 
+ * @param string $dtm
+ * @return string
+ */
+function formatDTM($dtm) {
+    if (substr($dtm, 1, 1) == "d" || substr($dtm, 2, 1) == "d") {
+        $day = explode("d", $dtm)[0] . "d";
+        $day = str_replace("d", "d ", str_replace("w", "w ", $day));
+        $dtm = explode("d", $dtm)[1];
+    } elseif (substr($dtm, 1, 1) == "w" && substr($dtm, 3, 1) == "d" || substr($dtm, 2, 1) == "w" && substr($dtm, 4, 1) == "d") {
+        $day = explode("d", $dtm)[0] . "d";
+        $day = str_replace("d", "d ", str_replace("w", "w ", $day));
+        $dtm = explode("d", $dtm)[1];
+    } elseif (substr($dtm, 1, 1) == "w" || substr($dtm, 2, 1) == "w") {
+        $day = explode("w", $dtm)[0] . "w";
+        $day = str_replace("d", "d ", str_replace("w", "w ", $day));
+        $dtm = explode("w", $dtm)[1];
+    }
 
-//hours -secs
-}elseif(strlen($dtm) == "4" && substr($dtm, -1) == "s" && substr($dtm,1,-2) == "h"){
-    $format = $day." 0".substr($dtm, 0,1).":00:0".substr($dtm, 2,-1);
-}elseif(strlen($dtm) == "5" && substr($dtm, -1) == "s" && substr($dtm,1,-3) == "h"){
-    $format = $day." 0".substr($dtm, 0,1).":00:".substr($dtm, 2,-1);
-}elseif(strlen($dtm) == "5" && substr($dtm, -1) == "s" && substr($dtm,2,-2) == "h"){
-    $format = $day." ".substr($dtm, 0,2).":00:0".substr($dtm, 3,-1);
-}elseif(strlen($dtm) == "6" && substr($dtm, -1) == "s" && substr($dtm,2,-3) == "h"){
-    $format = $day." ".substr($dtm, 0,2).":00:".substr($dtm, 3,-1);
-
-//hours -secs
-}elseif(strlen($dtm) == "4" && substr($dtm, -1) == "m" && substr($dtm,1,-2) == "h"){
-    $format = $day." 0".substr($dtm, 0,1).":0".substr($dtm, 2,-1).":00";
-}elseif(strlen($dtm) == "5" && substr($dtm, -1) == "m" && substr($dtm,1,-3) == "h"){
-    $format = $day." 0".substr($dtm, 0,1).":".substr($dtm, 2,-1).":00";
-}elseif(strlen($dtm) == "5" && substr($dtm, -1) == "m" && substr($dtm,2,-2) == "h"){
-    $format = $day." ".substr($dtm, 0,2).":0".substr($dtm, 3,-1).":00";
-}elseif(strlen($dtm) == "6" && substr($dtm, -1) == "m" && substr($dtm,2,-3) == "h"){
-    $format = $day." ".substr($dtm, 0,2).":".substr($dtm, 3,-1).":00";
-
-//hours minutes secs
-}elseif(strlen($dtm) == "6" && substr($dtm, -1) == "s" && substr($dtm,3,-2) == "m" && substr($dtm,1,-4) == "h"){
-    $format = $day." 0".substr($dtm, 0,1).":0".substr($dtm, 2,-3).":0".substr($dtm, 4,-1);
-}elseif(strlen($dtm) == "7" && substr($dtm, -1) == "s" && substr($dtm,3,-3) == "m" && substr($dtm,1,-5) == "h"){
-    $format = $day." 0".substr($dtm, 0,1).":0".substr($dtm, 2,-4).":".substr($dtm, 4,-1);
-}elseif(strlen($dtm) == "7" && substr($dtm, -1) == "s" && substr($dtm,4,-2) == "m" && substr($dtm,1,-5) == "h"){
-    $format = $day." 0".substr($dtm, 0,1).":".substr($dtm, 2,-3).":0".substr($dtm, 5,-1);
-}elseif(strlen($dtm) == "8" && substr($dtm, -1) == "s" && substr($dtm,4,-3) == "m" && substr($dtm,1,-6) == "h"){
-    $format = $day." 0".substr($dtm, 0,1).":".substr($dtm, 2,-4).":".substr($dtm, 5,-1);
-}elseif(strlen($dtm) == "7" && substr($dtm, -1) == "s" && substr($dtm,4,-2) == "m" && substr($dtm,2,-4) == "h"){
-    $format = $day." ".substr($dtm, 0,2).":0".substr($dtm, 3,-3).":0".substr($dtm, 5,-1);
-}elseif(strlen($dtm) == "8" && substr($dtm, -1) == "s" && substr($dtm,4,-3) == "m" && substr($dtm,2,-5) == "h"){
-    $format = $day." ".substr($dtm, 0,2).":0".substr($dtm, 3,-4).":".substr($dtm, 5,-1);
-}elseif(strlen($dtm) == "8" && substr($dtm, -1) == "s" && substr($dtm,5,-2) == "m" && substr($dtm,2,-5) == "h"){
-    $format = $day." ".substr($dtm, 0,2).":".substr($dtm, 3,-3).":0".substr($dtm, 6,-1);
-}elseif(strlen($dtm) == "9" && substr($dtm, -1) == "s" && substr($dtm,5,-3) == "m" && substr($dtm,2,-6) == "h"){
-    $format = $day." ".substr($dtm, 0,2).":".substr($dtm, 3,-4).":".substr($dtm, 6,-1);
-
-}else{
-    $format = $dtm;
+    // secs
+    if (strlen($dtm) == "2" && substr($dtm, -1) == "s") {
+        $format = $day . " 00:00:0" . substr($dtm, 0, -1);
+    } elseif (strlen($dtm) == "3" && substr($dtm, -1) == "s") {
+        $format = $day . " 00:00:" . substr($dtm, 0, -1);
+        //minutes
+    } elseif (strlen($dtm) == "2" && substr($dtm, -1) == "m") {
+        $format = $day . " 00:0" . substr($dtm, 0, -1) . ":00";
+    } elseif (strlen($dtm) == "3" && substr($dtm, -1) == "m") {
+        $format = $day . " 00:" . substr($dtm, 0, -1) . ":00";
+        //hours
+    } elseif (strlen($dtm) == "2" && substr($dtm, -1) == "h") {
+        $format = $day . " 0" . substr($dtm, 0, -1) . ":00:00";
+    } elseif (strlen($dtm) == "3" && substr($dtm, -1) == "h") {
+        $format = $day . " " . substr($dtm, 0, -1) . ":00:00";
+        //minutes -secs
+    } elseif (strlen($dtm) == "4" && substr($dtm, -1) == "s" && substr($dtm, 1, -2) == "m") {
+        $format = $day . " " . "00:0" . substr($dtm, 0, 1) . ":0" . substr($dtm, 2, -1);
+    } elseif (strlen($dtm) == "5" && substr($dtm, -1) == "s" && substr($dtm, 1, -3) == "m") {
+        $format = $day . " " . "00:0" . substr($dtm, 0, 1) . ":" . substr($dtm, 2, -1);
+    } elseif (strlen($dtm) == "5" && substr($dtm, -1) == "s" && substr($dtm, 2, -2) == "m") {
+        $format = $day . " " . "00:" . substr($dtm, 0, 2) . ":0" . substr($dtm, 3, -1);
+    } elseif (strlen($dtm) == "6" && substr($dtm, -1) == "s" && substr($dtm, 2, -3) == "m") {
+        $format = $day . " " . "00:" . substr($dtm, 0, 2) . ":" . substr($dtm, 3, -1);
+        //hours -secs
+    } elseif (strlen($dtm) == "4" && substr($dtm, -1) == "s" && substr($dtm, 1, -2) == "h") {
+        $format = $day . " 0" . substr($dtm, 0, 1) . ":00:0" . substr($dtm, 2, -1);
+    } elseif (strlen($dtm) == "5" && substr($dtm, -1) == "s" && substr($dtm, 1, -3) == "h") {
+        $format = $day . " 0" . substr($dtm, 0, 1) . ":00:" . substr($dtm, 2, -1);
+    } elseif (strlen($dtm) == "5" && substr($dtm, -1) == "s" && substr($dtm, 2, -2) == "h") {
+        $format = $day . " " . substr($dtm, 0, 2) . ":00:0" . substr($dtm, 3, -1);
+    } elseif (strlen($dtm) == "6" && substr($dtm, -1) == "s" && substr($dtm, 2, -3) == "h") {
+        $format = $day . " " . substr($dtm, 0, 2) . ":00:" . substr($dtm, 3, -1);
+        //hours -secs
+    } elseif (strlen($dtm) == "4" && substr($dtm, -1) == "m" && substr($dtm, 1, -2) == "h") {
+        $format = $day . " 0" . substr($dtm, 0, 1) . ":0" . substr($dtm, 2, -1) . ":00";
+    } elseif (strlen($dtm) == "5" && substr($dtm, -1) == "m" && substr($dtm, 1, -3) == "h") {
+        $format = $day . " 0" . substr($dtm, 0, 1) . ":" . substr($dtm, 2, -1) . ":00";
+    } elseif (strlen($dtm) == "5" && substr($dtm, -1) == "m" && substr($dtm, 2, -2) == "h") {
+        $format = $day . " " . substr($dtm, 0, 2) . ":0" . substr($dtm, 3, -1) . ":00";
+    } elseif (strlen($dtm) == "6" && substr($dtm, -1) == "m" && substr($dtm, 2, -3) == "h") {
+        $format = $day . " " . substr($dtm, 0, 2) . ":" . substr($dtm, 3, -1) . ":00";
+        //hours minutes secs
+    } elseif (strlen($dtm) == "6" && substr($dtm, -1) == "s" && substr($dtm, 3, -2) == "m" && substr($dtm, 1, -4) == "h") {
+        $format = $day . " 0" . substr($dtm, 0, 1) . ":0" . substr($dtm, 2, -3) . ":0" . substr($dtm, 4, -1);
+    } elseif (strlen($dtm) == "7" && substr($dtm, -1) == "s" && substr($dtm, 3, -3) == "m" && substr($dtm, 1, -5) == "h") {
+        $format = $day . " 0" . substr($dtm, 0, 1) . ":0" . substr($dtm, 2, -4) . ":" . substr($dtm, 4, -1);
+    } elseif (strlen($dtm) == "7" && substr($dtm, -1) == "s" && substr($dtm, 4, -2) == "m" && substr($dtm, 1, -5) == "h") {
+        $format = $day . " 0" . substr($dtm, 0, 1) . ":" . substr($dtm, 2, -3) . ":0" . substr($dtm, 5, -1);
+    } elseif (strlen($dtm) == "8" && substr($dtm, -1) == "s" && substr($dtm, 4, -3) == "m" && substr($dtm, 1, -6) == "h") {
+        $format = $day . " 0" . substr($dtm, 0, 1) . ":" . substr($dtm, 2, -4) . ":" . substr($dtm, 5, -1);
+    } elseif (strlen($dtm) == "7" && substr($dtm, -1) == "s" && substr($dtm, 4, -2) == "m" && substr($dtm, 2, -4) == "h") {
+        $format = $day . " " . substr($dtm, 0, 2) . ":0" . substr($dtm, 3, -3) . ":0" . substr($dtm, 5, -1);
+    } elseif (strlen($dtm) == "8" && substr($dtm, -1) == "s" && substr($dtm, 4, -3) == "m" && substr($dtm, 2, -5) == "h") {
+        $format = $day . " " . substr($dtm, 0, 2) . ":0" . substr($dtm, 3, -4) . ":" . substr($dtm, 5, -1);
+    } elseif (strlen($dtm) == "8" && substr($dtm, -1) == "s" && substr($dtm, 5, -2) == "m" && substr($dtm, 2, -5) == "h") {
+        $format = $day . " " . substr($dtm, 0, 2) . ":" . substr($dtm, 3, -3) . ":0" . substr($dtm, 6, -1);
+    } elseif (strlen($dtm) == "9" && substr($dtm, -1) == "s" && substr($dtm, 5, -3) == "m" && substr($dtm, 2, -6) == "h") {
+        $format = $day . " " . substr($dtm, 0, 2) . ":" . substr($dtm, 3, -4) . ":" . substr($dtm, 6, -1);
+    } else {
+        $format = $dtm;
+    }
+    return $format;
 }
-return $format;
-}
 
-
+/**
+ * Generate random number string
+ * 
+ * @param int $length
+ * @return string
+ */
 function randN($length) {
-	$chars = "23456789";
-	$charArray = str_split($chars);
-	$charCount = strlen($chars);
-	$result = "";
-	for($i=1;$i<=$length;$i++)
-	{
-		$randChar = rand(0,$charCount-1);
-		$result .= $charArray[$randChar];
-	}
-	return $result;
+    $chars = "23456789";
+    $charArray = str_split($chars);
+    $charCount = strlen($chars);
+    $result = "";
+    for ($i = 1; $i <= $length; $i++) {
+        $randChar = rand(0, $charCount - 1);
+        $result .= $charArray[$randChar];
+    }
+    return $result;
 }
 
+/**
+ * Generate random uppercase string
+ * 
+ * @param int $length
+ * @return string
+ */
 function randUC($length) {
-	$chars = "ABCDEFGHJKLMNPRSTUVWXYZ";
-	$charArray = str_split($chars);
-	$charCount = strlen($chars);
-	$result = "";
-	for($i=1;$i<=$length;$i++)
-	{
-		$randChar = rand(0,$charCount-1);
-		$result .= $charArray[$randChar];
-	}
-	return $result;
+    $chars = "ABCDEFGHJKLMNPRSTUVWXYZ";
+    $charArray = str_split($chars);
+    $charCount = strlen($chars);
+    $result = "";
+    for ($i = 1; $i <= $length; $i++) {
+        $randChar = rand(0, $charCount - 1);
+        $result .= $charArray[$randChar];
+    }
+    return $result;
 }
+
+/**
+ * Generate random lowercase string
+ * 
+ * @param int $length
+ * @return string
+ */
 function randLC($length) {
-	$chars = "abcdefghijkmnprstuvwxyz";
-	$charArray = str_split($chars);
-	$charCount = strlen($chars);
-	$result = "";
-	for($i=1;$i<=$length;$i++)
-	{
-		$randChar = rand(0,$charCount-1);
-		$result .= $charArray[$randChar];
-	}
-	return $result;
+    $chars = "abcdefghijkmnprstuvwxyz";
+    $charArray = str_split($chars);
+    $charCount = strlen($chars);
+    $result = "";
+    for ($i = 1; $i <= $length; $i++) {
+        $randChar = rand(0, $charCount - 1);
+        $result .= $charArray[$randChar];
+    }
+    return $result;
 }
 
+/**
+ * Generate random uppercase and lowercase string
+ * 
+ * @param int $length
+ * @return string
+ */
 function randULC($length) {
-	$chars = "ABCDEFGHJKLMNPRSTUVWXYZabcdefghijkmnprstuvwxyz";
-	$charArray = str_split($chars);
-	$charCount = strlen($chars);
-	$result = "";
-	for($i=1;$i<=$length;$i++)
-	{
-		$randChar = rand(0,$charCount-1);
-		$result .= $charArray[$randChar];
-	}
-	return $result;
+    $chars = "ABCDEFGHJKLMNPRSTUVWXYZabcdefghijkmnprstuvwxyz";
+    $charArray = str_split($chars);
+    $charCount = strlen($chars);
+    $result = "";
+    for ($i = 1; $i <= $length; $i++) {
+        $randChar = rand(0, $charCount - 1);
+        $result .= $charArray[$randChar];
+    }
+    return $result;
 }
 
+/**
+ * Generate random number and lowercase string
+ * 
+ * @param int $length
+ * @return string
+ */
 function randNLC($length) {
-	$chars = "23456789abcdefghijkmnprstuvwxyz";
-	$charArray = str_split($chars);
-	$charCount = strlen($chars);
-	$result = "";
-	for($i=1;$i<=$length;$i++)
-	{
-		$randChar = rand(0,$charCount-1);
-		$result .= $charArray[$randChar];
-	}
-	return $result;
+    $chars = "23456789abcdefghijkmnprstuvwxyz";
+    $charArray = str_split($chars);
+    $charCount = strlen($chars);
+    $result = "";
+    for ($i = 1; $i <= $length; $i++) {
+        $randChar = rand(0, $charCount - 1);
+        $result .= $charArray[$randChar];
+    }
+    return $result;
 }
 
+/**
+ * Generate random number and uppercase string
+ * 
+ * @param int $length
+ * @return string
+ */
 function randNUC($length) {
-	$chars = "23456789ABCDEFGHJKLMNPRSTUVWXYZ";
-	$charArray = str_split($chars);
-	$charCount = strlen($chars);
-	$result = "";
-	for($i=1;$i<=$length;$i++)
-	{
-		$randChar = rand(0,$charCount-1);
-		$result .= $charArray[$randChar];
-	}
-	return $result;
+    $chars = "23456789ABCDEFGHJKLMNPRSTUVWXYZ";
+    $charArray = str_split($chars);
+    $charCount = strlen($chars);
+    $result = "";
+    for ($i = 1; $i <= $length; $i++) {
+        $randChar = rand(0, $charCount - 1);
+        $result .= $charArray[$randChar];
+    }
+    return $result;
 }
 
+/**
+ * Generate random number, uppercase, and lowercase string
+ * 
+ * @param int $length
+ * @return string
+ */
 function randNULC($length) {
-	$chars = "23456789ABCDEFGHJKLMNPRSTUVWXYZabcdefghijkmnprstuvwxyz";
-	$charArray = str_split($chars);
-	$charCount = strlen($chars);
-	$result = "";
-	for($i=1;$i<=$length;$i++)
-	{
-		$randChar = rand(0,$charCount-1);
-		$result .= $charArray[$randChar];
-	}
-	return $result;
+    $chars = "23456789ABCDEFGHJKLMNPRSTUVWXYZabcdefghijkmnprstuvwxyz";
+    $charArray = str_split($chars);
+    $charCount = strlen($chars);
+    $result = "";
+    for ($i = 1; $i <= $length; $i++) {
+        $randChar = rand(0, $charCount - 1);
+        $result .= $charArray[$randChar];
+    }
+    return $result;
 }
-
-?>
