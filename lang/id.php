@@ -204,4 +204,12 @@ $_delete_report = '
 		        <li>Menghapus Selling Report akan menghapus User Log juga.</li>
 		        <li>Disarankan untuk mengunduh '.$_user_log.' terlebih dahulu.</li>
 		      </ul>
-';
+
+// PPP
+$_ppp_secrets = "User PPP";
+$_ppp_profiles = "Profil PPP";
+$_ppp_active = "PPP Aktif";
+$_add_ppp_user = "Tambah User PPP";
+$_edit_ppp_user = "Edit User PPP";
+$_ppp_inactive = "PPP Inactive";
+              ';

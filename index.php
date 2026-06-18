@@ -478,6 +478,11 @@ elseif ($ppp == "edit-profile") {
   elseif ($ppp == "active") {
     include_once('./ppp/pppactive.php');
   }
+  
+// ppp inactive
+elseif ($ppp == "inactive") {
+    include_once('./ppp/pppinactive.php');
+}
 
 // remove ppp active connection
   elseif ($removepactive != "") {

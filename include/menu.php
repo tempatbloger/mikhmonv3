@@ -319,6 +319,19 @@ include('./info.php');
   <!--cookies-->
    <a href="./?hotspot=cookies&session=<?= $session; ?>" class="menu <?= $scookies; ?>"><i class=" fa fa-hourglass"></i> <?= $_hotspot_cookies ?></a>
   </div>
+  
+  <!-- ====== PPP MENU ====== -->
+  <div class="dropdown-btn <?= $mppp; ?>"><i class="fa fa-share-alt"></i> PPP
+    <i class="fa fa-caret-down"></i>
+  </div>
+  <div class="dropdown-container <?= $pppmenu; ?>">
+    <a href="./?ppp=secrets&session=<?= $session; ?>" class="<?= $ssecrets; ?>"><i class="fa fa-users"></i> User PPP</a>
+    <a href="./?ppp=profiles&session=<?= $session; ?>" class="<?= $spprofile; ?>"><i class="fa fa-gear"></i> Profil PPP</a>
+    <a href="./?ppp=active&session=<?= $session; ?>" class="<?= $spactive; ?>"><i class="fa fa-user-md"></i> PPP Aktif</a>
+    <a href="./?ppp=inactive&session=<?= $session; ?>" class="<?= $spinactive; ?>"><i class="fa fa-unlink"></i> PPP Inactive</a>
+  </div>
+  <!-- ====== END PPP MENU ====== -->
+  
   <!--quick print-->
   <a href="./?hotspot=quick-print&session=<?= $session; ?>" class="menu <?= $squick; ?>"> <i class="fa fa-print"></i> <?= $_quick_print ?> </a>
   <!--vouchers-->
@@ -386,4 +399,3 @@ echo '<div class="main-container">';
   echo '<div class="main-container" style="display:none">';
 }
 ?>
-

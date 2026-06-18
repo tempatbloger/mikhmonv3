@@ -1,12 +1,12 @@
-### MIKHMON V3
+### MIKHMON V3.25s
 
-#### Download update.zip
-[update.zip](https://raw.githubusercontent.com/laksa19/laksa19.github.io/master/download/update.zip){:target="_blank"}
 
 ### Changelog
 
+
 #### Update 18-06 2026 V3.25
-1. Update RouterOS API class for v7 compatibility.
+1. Added PPP features: Secrets, Profiles, Active, Inactive.
+2. Update RouterOS API class for v7 compatibility.
 	- jalankan di terminal dengan command
 	  ```bash 
 	  docker-compose up -d 
