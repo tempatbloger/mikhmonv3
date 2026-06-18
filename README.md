@@ -5,6 +5,21 @@
 
 ### Changelog
 
+#### Update 18-06 2026 V3.25
+1. Update RouterOS API class for v7 compatibility.
+	- jalankan di terminal dengan command
+	  ```bash 
+	  docker-compose up -d 
+	  ```
+
+	- Login to localhost:8080. user:mikhmon password:1234
+
+	- menghentikan
+	 ```bash
+	  docker-compose down 
+	  ```
+
+
 #### Update 06-30 2021 V3.20
 1. Perbaikan typo script profile ```on-login```.
 	- Silakan update user profile dari Mikhmon, dengan cara membuka tiap user profile, kemudian klik Save.
